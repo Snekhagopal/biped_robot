@@ -69,7 +69,36 @@ class BipedEnv(gym.Env):
         reward_cfg = self.cfg["reward"]
         self.reward_weights = reward_cfg["weights"]
         self.tracking_sigma = float(reward_cfg["tracking_sigma"])
+        # Milestone 6: optional, narrower kernel for forward-velocity tracking
+        # alone. With the shared 0.25 width, standing still at a 0.2 m/s
+        # command keeps 85% of lin_vel_track, so EXP-005 never learned to
+        # modulate speed. Defaults to tracking_sigma (M3-M5 behaviour).
+        self.lin_vel_sigma = float(reward_cfg.get("lin_vel_sigma", self.tracking_sigma))
         self.fall_penalty = float(reward_cfg["fall_penalty"])
+
+        # Milestone 5: gait clock. EXP-003's first try advanced the phase at
+        # (cmd_speed) Hz -- at a 0.05 m/s command that is a 20 s step period,
+        # i.e. no usable timing signal. Stepping cadence is now a fixed
+        # frequency, switched on whenever the command asks for motion; at
+        # cmd=0 (stage 'stand') the clock stays frozen exactly as before.
+        gait_cfg = self.cfg.get("gait", {})
+        self.gait_freq_hz = float(gait_cfg.get("frequency_hz", 1.5))
+        self.gait_min_cmd = float(gait_cfg.get("min_cmd_speed", 0.05))
+        self.swing_height = float(gait_cfg.get("swing_height_m", 0.05))
+
+        # Milestone 7 (robustness), both off unless configured -- earlier
+        # stages are unchanged. domain_rand re-draws physical parameters every
+        # episode around the nominal model; pushes kick the base velocity at
+        # random times. All ranges are INITIAL ASSUMPTIONs sized to cover the
+        # uncertainty tags in config/robot.yaml, not measured hardware spread.
+        self.dr_cfg = self.cfg.get("domain_rand") or {}
+        self.push_cfg = self.cfg.get("pushes") or {}
+        self._nominal_friction = self.model.geom_friction[:, 0].copy()
+        self._torso_body = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "torso")
+        self._nominal_torso_mass = float(self.model.body_mass[self._torso_body])
+        self._nominal_torso_inertia = self.model.body_inertia[self._torso_body].copy()
+        self._motor_strength = np.ones(self.act.n)
+        self._next_push_step = -1
 
         self.rng = np.random.default_rng(seed)
         self.noise = SensorNoise(self.rng) if use_noise else None
@@ -101,6 +130,28 @@ class BipedEnv(gym.Env):
         return np.array([u(self.cmd_ranges["lin_vel_x"]),
                           u(self.cmd_ranges["lin_vel_y"]),
                           u(self.cmd_ranges["ang_vel_z"])])
+
+    def _randomize_physics(self) -> None:
+        """Re-draw the M7 domain-randomization parameters (no-op if unset)."""
+        m = self.model
+        m.geom_friction[:, 0] = self._nominal_friction
+        m.body_mass[self._torso_body] = self._nominal_torso_mass
+        m.body_inertia[self._torso_body] = self._nominal_torso_inertia
+        self._motor_strength = np.ones(self.act.n)
+        dr = self.dr_cfg
+        if "friction_scale" in dr:  # floor + soles: slide friction of every geom
+            m.geom_friction[:, 0] = self._nominal_friction * self.rng.uniform(*dr["friction_scale"])
+        if "torso_added_mass_kg" in dr:  # payload / mass-estimate error, inertia scaled along
+            new_mass = self._nominal_torso_mass + self.rng.uniform(*dr["torso_added_mass_kg"])
+            m.body_mass[self._torso_body] = new_mass
+            m.body_inertia[self._torso_body] = (self._nominal_torso_inertia
+                                                 * new_mass / self._nominal_torso_mass)
+        if "motor_strength" in dr:  # per-joint torque-constant error
+            self._motor_strength = self.rng.uniform(*dr["motor_strength"], size=self.act.n)
+
+    def _schedule_push(self) -> None:
+        lo, hi = self.push_cfg["interval_s"]
+        self._next_push_step = self._step_count + int(round(self.rng.uniform(lo, hi) / self.dt_ctrl))
 
     def _tilt_deg(self) -> float:
         R = np.zeros(9)
@@ -137,6 +188,7 @@ class BipedEnv(gym.Env):
         if self.noise is not None:
             self.noise.reset()
 
+        self._randomize_physics()
         mujoco.mj_resetDataKeyframe(self.model, self.data, self.kid)
         self.data.qpos[self.act.qpos_adr] += self.rng.uniform(
             -self.init_qpos_noise, self.init_qpos_noise, self.act.n)
@@ -146,11 +198,39 @@ class BipedEnv(gym.Env):
         self._prev_action = np.zeros(self.act.n)
         _, qd = self.act.joint_state(self.data)
         self._prev_qvel = qd.copy()
-        self._cmd = self._sample_command()
+        # options={"cmd": [vx, vy, wz]} pins the command (evaluation sweeps).
+        if options and "cmd" in options:
+            self._cmd = np.asarray(options["cmd"], dtype=np.float64).copy()
+        else:
+            self._cmd = self._sample_command()
         self._clock_phase = 0.0
         self._step_count = 0
+        self._next_push_step = -1
+        if self.push_cfg:
+            self._schedule_push()
 
         return self._get_obs(), {"cmd": self._cmd.copy()}
+
+    def _sole_clearance(self, side: str) -> float:
+        """Height of the sole box's lowest corner above the floor (z=0).
+        Not the ankle-frame height: heel/toe rocking lifts the ankle ~1 cm
+        while the sole is still planted, which would count as a 'step'."""
+        g = self._foot_geom[side]
+        corners = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)])
+        corners = corners * self.model.geom_size[g]
+        z = self.data.geom_xpos[g][2] + corners @ self.data.geom_xmat[g].reshape(3, 3)[2]
+        return float(z.min())
+
+    def _stepping(self) -> bool:
+        return float(np.linalg.norm(self._cmd[:2])) >= self.gait_min_cmd
+
+    def _desired_stance(self) -> list[bool]:
+        """[L, R] feet the clock wants on the ground: both while standing,
+        left on the first half-cycle and right on the second while stepping."""
+        if not self._stepping():
+            return [True, True]
+        left = np.sin(self._clock_phase) >= 0.0
+        return [bool(left), not left]
 
     def _get_obs(self) -> np.ndarray:
         return build_observation(self.data, self.act, self.q_nominal, self._cmd,
@@ -160,10 +240,16 @@ class BipedEnv(gym.Env):
         action = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)
         q_target = self.q_nominal + self.action_scale * action
 
+        pushed = self._step_count == self._next_push_step
+        if pushed:  # M7: instantaneous horizontal base-velocity kick
+            v = self.push_cfg["max_vel_xy"]
+            self.data.qvel[0:2] += self.rng.uniform(-v, v, size=2)
+            self._schedule_push()
+
         torque_sum = np.zeros(self.act.n)
         for _ in range(self.decimation):
             q, qd = self.act.joint_state(self.data)
-            tau = self.pd.compute(q, qd, q_target)
+            tau = self.pd.compute(q, qd, q_target) * self._motor_strength
             self.act.apply(self.data, tau)
             mujoco.mj_step(self.model, self.data)
             torque_sum += tau
@@ -198,13 +284,16 @@ class BipedEnv(gym.Env):
             "foot_xy_vel": [foot_vel["L"], foot_vel["R"]],
             "non_foot_contact": non_foot_hit,
             "terminated_by_fall": fall,
+            "desired_stance": self._desired_stance(),
+            "foot_height": [self._sole_clearance(s) for s in ("L", "R")],
+            "swing_height": self.swing_height,
         }
         reward, reward_terms = compute_reward(
-            state, self.reward_weights, self.tracking_sigma, self.fall_penalty)
+            state, self.reward_weights, self.tracking_sigma, self.fall_penalty,
+            lin_vel_sigma=self.lin_vel_sigma)
 
-        cmd_speed = float(np.linalg.norm(self._cmd[:2]))
-        if cmd_speed > 1e-3:
-            self._clock_phase += 2 * np.pi * cmd_speed * self.dt_ctrl
+        if self._stepping():
+            self._clock_phase += 2 * np.pi * self.gait_freq_hz * self.dt_ctrl
         self._prev_action = action.copy()
         self._prev_qvel = qd.copy()
         self._step_count += 1
@@ -217,6 +306,11 @@ class BipedEnv(gym.Env):
             "tilt_deg": tilt,
             "base_height": base_height,
             "base_linvel": state["base_linvel"],  # privileged; logging/eval only
+            "base_pos": self.data.qpos[0:3].copy(),
+            "foot_contact": (contact["L"], contact["R"]),
+            "foot_height": tuple(state["foot_height"]),
+            "cmd": self._cmd.copy(),
+            "pushed": pushed,
         }
         return obs, float(reward), bool(terminated), bool(truncated), info
 

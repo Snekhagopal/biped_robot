@@ -7,7 +7,7 @@
 # =====================================================================
 
 experiment:
-  id: EXP-000                 # bump per training run; log in experiments/EXP-registry.md
+  id: EXP-003                 # bump per training run; log in experiments/EXP-registry.md
   robot_version: robot.xml@M1
   env_version: biped_env.py@M3
   reward_version: rewards.py@M3

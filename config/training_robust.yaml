@@ -1,0 +1,124 @@
+# =====================================================================
+#  BR-1 training configuration — Milestone 7 (robust walking)
+#  config/training_walk.yaml (M6) plus per-episode domain randomization and
+#  random base-velocity pushes (env/biped_env.py, both off in earlier
+#  configs). Reward and PPO settings are unchanged from M6.
+#    python training/train.py --config training_robust.yaml --exp-id EXP-007 \
+#        --init-from policies/EXP-006_walk.zip
+#  This file IS the curriculum knob (Part 12): later stages change these
+#  numbers, not the environment code. curriculum_stage is a label only
+#  (for logging / experiments/EXP-registry.md) until training/train.py
+#  reads it to swap command ranges automatically.
+# =====================================================================
+
+experiment:
+  id: EXP-007                 # bump per training run; log in experiments/EXP-registry.md
+  robot_version: robot.xml@M1
+  env_version: biped_env.py@M7
+  reward_version: rewards.py@M6
+  curriculum_stage: robust    # stand | step | walk | walk_fast | turn | robust | terrain
+
+env:
+  episode_length_s: 10.0
+  control_decimation: 10       # 500 Hz physics / 10 = 50 Hz control (config/robot.yaml)
+  action_scale_rad: 0.30
+  init_qpos_noise_rad: 0.02    # small per-episode pose randomization (Part 15: start gentle)
+  use_sensor_noise: true
+  # Stage 'stand': commands sampled at 0 -> the tracking reward becomes a
+  # "stay still, don't drift" term. Milestone 5/6 widen these ranges; the
+  # environment code does not change.
+  command_ranges:
+    # 0.05 m/s (EXP-003) was too small to tell stepping from standing:
+    # tracking error 0.05^2 costs exp(-0.01)=0.99 of the reward. Sample
+    # 0..0.3 m/s instead; commands under gait.min_cmd_speed are "stand".
+    # M6: up to 0.4 m/s (EXP-005 topped out at ~0.15 whatever it was asked).
+    lin_vel_x: [0.0, 0.4]
+    lin_vel_y: [0.0, 0.0]
+    ang_vel_z: [0.0, 0.0]
+  termination:
+    # Deliberately loose for early training (Part 11) -- a policy that has
+    # not yet learned to balance needs room to wobble and still collect
+    # reward. Tighten as curriculum_stage advances.
+    # min_base_height_m was 0.55 for EXP-001; that run's mean_tilt_deg stayed
+    # flat at ~13-16 deg for its entire 770k steps (nowhere near
+    # max_tilt_deg) while episodes kept ending early -- i.e. almost every
+    # termination was a height-triggered "knee buckle" from exploration
+    # noise, not an actual fall. Loosened to 0.45 so the policy survives
+    # further into a crouch before being cut off.
+    max_tilt_deg: 40
+    min_base_height_m: 0.45
+
+# M7: re-drawn every episode. INITIAL ASSUMPTIONs sized to the uncertainty
+# tags in config/robot.yaml (friction, segment masses, ideal torque source),
+# not measured hardware spread -- narrow/widen them in Milestone 9.
+domain_rand:
+  friction_scale: [0.5, 1.25]       # x nominal slide friction (floor and soles)
+  torso_added_mass_kg: [-1.0, 3.0]  # on the 14.6 kg torso: estimate error / payload
+  motor_strength: [0.85, 1.15]      # per joint, x commanded PD torque
+
+# M7: instantaneous horizontal base-velocity kick, uniform in [-v, v] per
+# axis, every interval_s. EXP-005 standing fell to a single 0.25 m/s +x kick.
+pushes:
+  interval_s: [3.0, 6.0]
+  max_vel_xy: 0.5
+
+gait:
+  frequency_hz: 1.5            # full L+R cycle; INITIAL ASSUMPTION (~human slow walk)
+  min_cmd_speed: 0.05          # |cmd_xy| below this -> clock frozen, both feet down
+  swing_height_m: 0.05         # swing-foot clearance that earns full swing_clearance reward
+
+reward:
+  # exp(-error^2 / tracking_sigma) width used by the tracking terms
+  tracking_sigma: 0.25
+  # M6: forward-velocity kernel only. At 0.25, standing still at a 0.2 m/s
+  # command kept 85% of lin_vel_track and the 0.13 m/s one-pace gait kept
+  # >=89% at every command up to 0.3, so gait_contact + swing_clearance (<=1.5/step)
+  # out-earned speed (EXP-005). At 0.02 a 0.1 m/s error keeps 61% and a
+  # 0.2 m/s error 14%, i.e. up to ~2.6/step at weight 3 -- larger than the
+  # gait terms' total.
+  lin_vel_sigma: 0.02
+  fall_penalty: 10.0
+  # torque/joint_acc are now normalized to O(1) in env/rewards.py (see that
+  # file's docstring for why -- EXP-001's raw sum(tau^2) penalty could swing
+  # to -15..-20/step during early exploration, versus a well-behaved-state
+  # total of about +3..+4, making "end the episode fast" locally optimal).
+  # Weights below are rescaled for the normalized terms; re-tune with
+  # TensorBoard once more runs exist.
+  weights:
+    lin_vel_track: 3.0   # M6: was 1.5; see lin_vel_sigma above
+    ang_vel_track: 0.5
+    upright: 1.0
+    height: 0.5
+    alive: 0.5
+    torque: 0.5
+    action_rate: 0.05
+    joint_acc: 0.1
+    foot_slip: 0.5
+    collision: 1.0
+    gait_contact: 1.0     # M5: foot contacts match the gait clock
+    swing_clearance: 0.5  # M5: swing foot actually lifts (not a 1 mm hover)
+
+training:
+  # M6: every N env steps, run the pinned-command speed sweep
+  # (training/evaluate.py) and keep the lowest-|vx error| fall-free model
+  # as policies/<exp-id>_best_speed.zip. EvalCallback's best-reward model
+  # is still saved too, but is NOT the one to pick (EXP-005 lesson).
+  speed_sweep_every: 100000
+
+ppo:                            # consumed by training/train.py, Milestone 4
+  algo: PPO
+  n_envs: 8
+  n_steps: 2048
+  batch_size: 256
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  # EXP-004 (lr 3e-4, no KL cap) ran clip_fraction 0.2-0.6 / approx_kl up
+  # to 0.077 for its whole run, then collapsed between 2.85M and 3.0M steps
+  # (0% -> 100% falls). Smaller, KL-capped updates from EXP-005 on.
+  learning_rate: 0.0001
+  target_kl: 0.02
+  clip_range: 0.2
+  ent_coef: 0.0
+  total_timesteps: 4000000
+  seed: 0

@@ -10,6 +10,7 @@ R = w_vel * lin_vel_track + w_ang * ang_vel_track + w_up * upright
   + w_h * height + w_alive * alive
   - w_tau * torque - w_ar * action_rate - w_ja * joint_acc
   - w_slip * foot_slip - w_col * collision
+  + w_gait * gait_contact + w_clear * swing_clearance        (Milestone 5)
   - fall_penalty * (1 if terminated by falling else 0)
 
 REWARD-HACKING GUARDS (Part 10) -- what each penalty is there to stop:
@@ -38,6 +39,15 @@ REWARD-HACKING GUARDS (Part 10) -- what each penalty is there to stop:
                                       kernel caps the achievable reward at
                                       "moving exactly at the requested
                                       speed", removing that incentive.
+  gait_contact + swing_clearance   -> (M5) at slow commands, velocity
+                                      tracking alone barely separates
+                                      "stepping" from "leaning/shuffling"
+                                      (0.1 m/s error costs exp(-0.04)=0.96).
+                                      These pay for lifting the foot the
+                                      gait clock says is in swing; binary
+                                      contact alone could be farmed with a
+                                      1 mm hover, hence the clearance term.
+                                      Both are 0-weight at stage 'stand'.
 
 NORMALIZATION (added after EXP-001, revised after EXP-001b/c):
 EXP-001's torque penalty was raw sum(tau^2) in Nm^2, unbounded up to
@@ -78,11 +88,14 @@ SLIP_CLIP = 2.0     # m/s -- INITIAL ASSUMPTION, "already clearly sliding"
 
 
 def compute_reward(state: dict, weights: dict, tracking_sigma: float,
-                    fall_penalty: float) -> tuple[float, dict]:
+                    fall_penalty: float, lin_vel_sigma: float | None = None) -> tuple[float, dict]:
     r = {}
 
+    # lin_vel_sigma (M6) narrows only the forward-velocity kernel; None keeps
+    # the shared tracking_sigma, i.e. the M3-M5 reward exactly.
+    lin_sigma = tracking_sigma if lin_vel_sigma is None else lin_vel_sigma
     lin_err = float(np.sum((state["base_linvel"][:2] - state["cmd"][:2]) ** 2))
-    r["lin_vel_track"] = float(np.exp(-lin_err / tracking_sigma))
+    r["lin_vel_track"] = float(np.exp(-lin_err / lin_sigma))
 
     ang_err = float((state["base_angvel_z"] - state["cmd"][2]) ** 2)
     r["ang_vel_track"] = float(np.exp(-ang_err / tracking_sigma))
@@ -110,6 +123,15 @@ def compute_reward(state: dict, weights: dict, tracking_sigma: float,
     r["foot_slip"] = -float(np.mean(slip_terms)) if slip_terms else 0.0
 
     r["collision"] = -1.0 if state["non_foot_contact"] else 0.0
+
+    # Milestone 5 stepping terms, both in [0, 1]. Keys are optional so older
+    # callers (tests, M3/M4 probes) that don't supply gait state still work.
+    if "desired_stance" in state:
+        matches = [c == d for c, d in zip(state["foot_contact"], state["desired_stance"])]
+        r["gait_contact"] = float(np.mean(matches))
+        clear = [np.clip(h, 0.0, state["swing_height"]) / state["swing_height"]
+                 for h, d in zip(state["foot_height"], state["desired_stance"]) if not d]
+        r["swing_clearance"] = float(np.mean(clear)) if clear else 0.0
 
     total = sum(weights.get(name, 0.0) * value for name, value in r.items())
     if state["terminated_by_fall"]:

@@ -54,3 +54,27 @@ def test_zero_action_eventually_terminates(env):
         if terminated or truncated:
             return
     pytest.fail("episode never ended under zero action (expected a fall ~1.8s in)")
+
+
+def test_reset_can_pin_command(env):
+    _, info = env.reset(seed=0, options={"cmd": [0.3, 0.0, 0.0]})
+    np.testing.assert_allclose(info["cmd"], [0.3, 0.0, 0.0])
+    assert env._stepping()
+
+
+def test_lin_vel_sigma_only_narrows_forward_tracking():
+    from env.rewards import compute_reward
+    state = {
+        "base_linvel": np.zeros(3), "base_angvel_z": 0.0, "cmd": np.array([0.2, 0.0, 0.0]),
+        "projected_gravity": np.array([0.0, 0.0, -1.0]), "base_height": 1.0, "height_target": 1.0,
+        "torque": np.zeros(12), "torque_limit": np.ones(12), "action": np.zeros(12),
+        "prev_action": np.zeros(12), "qvel": np.zeros(12), "prev_qvel": np.zeros(12), "dt": 0.02,
+        "foot_contact": [True, True], "foot_xy_vel": [np.zeros(2)] * 2,
+        "non_foot_contact": False, "terminated_by_fall": False,
+    }
+    w = {"lin_vel_track": 1.0, "upright": 1.0}
+    _, wide = compute_reward(state, w, 0.25, 10.0)
+    _, narrow = compute_reward(state, w, 0.25, 10.0, lin_vel_sigma=0.02)
+    assert wide["lin_vel_track"] == pytest.approx(np.exp(-0.04 / 0.25))
+    assert narrow["lin_vel_track"] == pytest.approx(np.exp(-0.04 / 0.02))
+    assert wide["upright"] == narrow["upright"]
